@@ -1,0 +1,730 @@
+"""
+EEG Conformer 
+
+Convolutional Transformer for EEG decoding
+
+Couple CNN and Transformer in a concise manner with amazing results
+"""
+# remember to change paths
+
+import argparse
+import os
+gpus = [0]
+os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, gpus))
+import numpy as np
+import math
+import glob
+import random
+import itertools
+import datetime
+import time
+import datetime
+import sys
+import scipy.io
+
+import torchvision.transforms as transforms
+from torchvision.utils import save_image, make_grid
+
+from torch.utils.data import DataLoader
+from torch.autograd import Variable
+from torchsummary import summary
+import torch.autograd as autograd
+from torchvision.models import vgg19
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+import torch.nn.init as init
+
+from torch.utils.data import Dataset
+from PIL import Image
+import torchvision.transforms as transforms
+from sklearn.decomposition import PCA
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+from torch import nn
+from torch import Tensor
+from PIL import Image
+from torchvision.transforms import Compose, Resize, ToTensor
+from einops import rearrange, reduce, repeat
+from einops.layers.torch import Rearrange, Reduce
+# from common_spatial_pattern import csp
+
+import matplotlib.pyplot as plt
+# from torch.utils.tensorboard import SummaryWriter
+from torch.backends import cudnn
+cudnn.benchmark = False
+cudnn.deterministic = True
+
+# writer = SummaryWriter('./TensorBoardX/')
+
+
+# Convolution module
+# use conv to capture local features, instead of postion embedding.
+class MultiScaleTemporalConv(nn.Module):
+    """
+    多尺度时间卷积模块
+    
+    原理：使用3个不同大小的卷积核并行提取特征
+    - kernel=13: 捕获高频成分 (~50ms, >30Hz)
+    - kernel=25: 捕获中频成分 (~100ms, 8-30Hz) 
+    - kernel=51: 捕获低频成分 (~200ms, <8Hz)
+    
+    为什么这样设计？
+    1. EEG信号是多频率混合的，单一kernel只能看到一个频率范围
+    2. 癫痫发作前期同时包含高频尖峰和低频慢波
+    3. 类似Inception网络，用多分支捕获不同尺度特征
+    """
+    def __init__(self, in_channels=1, out_channels=40):
+        super().__init__()
+        
+        # 将输出通道均分为3份
+        branch_channels = out_channels // 3
+        
+        # 短时特征分支 (kernel=13)
+        # padding=6 保证输出时间维度不变 (same padding)
+        self.short_conv = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, (1, 13), (1, 1), padding=(0, 6)),
+            nn.BatchNorm2d(branch_channels),
+            nn.ELU()
+        )
+        
+        # 中时特征分支 (kernel=25, 原始尺度)
+        self.mid_conv = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, (1, 25), (1, 1), padding=(0, 12)),
+            nn.BatchNorm2d(branch_channels),
+            nn.ELU()
+        )
+        
+        # 长时特征分支 (kernel=51)
+        self.long_conv = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels + (out_channels % 3), (1, 51), (1, 1), padding=(0, 25)),
+            nn.BatchNorm2d(branch_channels + (out_channels % 3)),
+            nn.ELU()
+        )
+        
+    def forward(self, x):
+        # 并行提取3个尺度的特征
+        short = self.short_conv(x)  # (B, 13, 22, T)
+        mid = self.mid_conv(x)      # (B, 13, 22, T)
+        long = self.long_conv(x)    # (B, 14, 22, T)
+        
+        # 在通道维度拼接 → (B, 40, 22, T)
+        return torch.cat([short, mid, long], dim=1)
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, emb_size=40, use_multiscale=False, dropout=0.5):
+        """
+        Patch Embedding模块
+        
+        参数：
+            emb_size: 嵌入维度
+            use_multiscale: 是否使用多尺度卷积
+                - False: 使用原始单一卷积（消融实验基线）
+                - True: 使用多尺度卷积（改进版本）
+            dropout: Dropout率（多尺度时建议0.6，基线0.5）
+        """
+        super().__init__()
+        self.use_multiscale = use_multiscale
+
+        if use_multiscale:
+            # 改进版：多尺度时间卷积
+            self.shallownet = nn.Sequential(
+                MultiScaleTemporalConv(in_channels=1, out_channels=40),  # 多尺度提取
+                nn.Conv2d(40, 40, (22, 1), (1, 1)),  # 空间卷积
+                nn.BatchNorm2d(40),
+                nn.ELU(),
+                nn.AvgPool2d((1, 75), (1, 7)),  # 降采样
+                nn.Dropout(dropout),  # 使用可配置dropout
+            )
+        else:
+            # 原始版：单一卷积核
+            self.shallownet = nn.Sequential(
+                nn.Conv2d(1, 40, (1, 32), (1, 1)),
+                nn.Conv2d(40, 40, (22, 1), (1, 1)),
+                nn.BatchNorm2d(40),
+                nn.ELU(),
+                nn.AvgPool2d((1, 75), (1, 5)),  # stride 10→7
+                nn.Dropout(dropout),  # 使用可配置dropout
+            )
+
+        self.projection = nn.Sequential(
+            nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),
+            Rearrange('b e (h) (w) -> b (h w) e'),
+        )
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, _, _, _ = x.shape
+        x = self.shallownet(x)
+        x = self.projection(x)
+        return x
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, emb_size, num_heads, dropout):
+        super().__init__()
+        self.emb_size = emb_size
+        self.num_heads = num_heads
+        self.keys = nn.Linear(emb_size, emb_size)
+        self.queries = nn.Linear(emb_size, emb_size)
+        self.values = nn.Linear(emb_size, emb_size)
+        self.att_drop = nn.Dropout(dropout)
+        self.projection = nn.Linear(emb_size, emb_size)
+
+    def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
+        queries = rearrange(self.queries(x), "b n (h d) -> b h n d", h=self.num_heads)
+        keys = rearrange(self.keys(x), "b n (h d) -> b h n d", h=self.num_heads)
+        values = rearrange(self.values(x), "b n (h d) -> b h n d", h=self.num_heads)
+        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys)  
+        if mask is not None:
+            fill_value = torch.finfo(torch.float32).min
+            energy.mask_fill(~mask, fill_value)
+
+        scaling = self.emb_size ** (1 / 2)
+        att = F.softmax(energy / scaling, dim=-1)
+        att = self.att_drop(att)
+        out = torch.einsum('bhal, bhlv -> bhav ', att, values)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.projection(out)
+        return out
+
+
+class ResidualAdd(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        res = x
+        x = self.fn(x, **kwargs)
+        x += res
+        return x
+
+
+class FeedForwardBlock(nn.Sequential):
+    def __init__(self, emb_size, expansion, drop_p):
+        super().__init__(
+            nn.Linear(emb_size, expansion * emb_size),
+            nn.GELU(),
+            nn.Dropout(drop_p),
+            nn.Linear(expansion * emb_size, emb_size),
+        )
+
+
+class GELU(nn.Module):
+    def forward(self, input: Tensor) -> Tensor:
+        return input*0.5*(1.0+torch.erf(input/math.sqrt(2.0)))
+
+
+class TemporalPositionEncoding(nn.Module):
+    """
+    时间位置编码（正弦/余弦）
+    
+    为EEG序列的每个时间步添加位置信息
+    使用正弦/余弦函数生成位置编码，具有以下特性：
+    1. 平滑连续：相邻位置的编码向量相似
+    2. 可泛化：可以外推到训练时未见过的序列长度
+    3. 多尺度：不同维度捕获不同时间尺度的位置信息
+    4. 缩放控制：通过scale参数控制位置信息的强度，避免淹没特征信息
+    """
+    def __init__(self, d_model, max_len=5000, scale=0.1):
+        super().__init__()
+        
+        self.scale = scale  # 位置编码的缩放因子
+        
+        # 创建位置编码矩阵 (max_len, d_model)
+        pe = torch.zeros(max_len, d_model)
+        
+        # 位置索引 (max_len, 1)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        
+        # 分母项：10000^(2i/d_model)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * 
+            (-math.log(10000.0) / d_model)
+        )
+        
+        # 偶数维度用sin，奇数维度用cos
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # 添加batch维度 (1, max_len, d_model)
+        pe = pe.unsqueeze(0)
+        
+        # 注册为buffer（不是参数，不会被优化器更新）
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (batch_size, seq_len, d_model) - Transformer的输入
+        Returns:
+            x + scaled_pe: 添加了缩放位置编码的输入
+        """
+        # 缩放位置编码，避免淹没特征信息
+        return x + self.scale * self.pe[:, :x.size(1), :]
+
+
+class TransformerEncoderBlock(nn.Sequential):
+    def __init__(self,
+                 emb_size,
+                 num_heads=10,
+                 drop_p=0.5,
+                 forward_expansion=4,
+                 forward_drop_p=0.5):
+        super().__init__(
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                MultiHeadAttention(emb_size, num_heads, drop_p),
+                nn.Dropout(drop_p)
+            )),
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                FeedForwardBlock(
+                    emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+                nn.Dropout(drop_p)
+            )
+            ))
+
+
+class TemporalConvBlock(nn.Module):
+    """因果时间卷积块（保持时序因果性）"""
+    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        
+        self.net = nn.Sequential(
+            self.conv1,
+            nn.BatchNorm1d(n_outputs),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            self.conv2,
+            nn.BatchNorm1d(n_outputs),
+            nn.ELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.padding = padding
+        
+    def forward(self, x):
+        # 保存原始长度
+        original_len = x.size(2)
+        
+        # 通过网络
+        out = self.net(x)
+        
+        # 去除因padding引入的未来信息（保持因果性）
+        if self.padding > 0:
+            out = out[:, :, :-self.padding]
+        
+        # 裁剪到原始长度（避免累积长度变化）
+        out = out[:, :, :original_len]
+        
+        # 残差连接
+        res = x if self.downsample is None else self.downsample(x)
+        
+        return F.elu(out + res)
+
+
+class TCN_Transformer_Hybrid(nn.Module):
+    """TCN + Transformer混合架构"""
+    def __init__(self, emb_size=40, num_channels=[40, 40, 40], depth=6, dropout=0.2):
+        super().__init__()
+        
+        # TCN部分（局部时序建模）
+        layers = []
+        for i in range(len(num_channels)):
+            dilation = 2 ** i
+            in_channels = emb_size if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers.append(TemporalConvBlock(in_channels, out_channels, 
+                                           kernel_size=3, dilation=dilation, dropout=dropout))
+        self.tcn = nn.Sequential(*layers)
+        
+        # Transformer部分（全局时序建模）
+        self.transformer = nn.Sequential(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+        
+    def forward(self, x):
+        # x: (B, seq_len, emb_size)
+        x = x.permute(0, 2, 1)  # (B, emb_size, seq_len)
+        x = self.tcn(x)
+        x = x.permute(0, 2, 1)  # (B, seq_len, emb_size)
+        x = self.transformer(x)
+        return x
+
+
+class TransformerEncoder(nn.Sequential):
+    def __init__(self, depth, emb_size):
+        super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+
+
+class ClassificationHead(nn.Module):
+    def __init__(self, emb_size, n_classes):
+        super().__init__()
+        
+        # global average pooling
+        self.clshead = nn.Sequential(
+            Reduce('b n e -> b e', reduction='mean'),
+            nn.LayerNorm(emb_size),
+            nn.Linear(emb_size, n_classes)
+        )
+        
+        # 动态初始化fc层（在第一次forward时确定输入维度）
+        self.fc = None
+        self.n_classes = n_classes
+        self.emb_size = emb_size
+
+    def forward(self, x):
+        # 展平
+        batch_size = x.size(0)
+        x_flat = x.contiguous().view(batch_size, -1)
+        
+        # 第一次forward时初始化fc层
+        if self.fc is None:
+            input_dim = x_flat.size(1)
+            self.fc = nn.Sequential(
+                nn.Linear(input_dim, 256),
+                nn.ELU(),
+                nn.Dropout(0.5),
+                nn.Linear(256, 32),
+                nn.ELU(),
+                nn.Dropout(0.3),
+                nn.Linear(32, self.n_classes)
+            ).to(x.device)
+        
+        out = self.fc(x_flat)
+        return x_flat, out
+
+
+class Conformer(nn.Module):
+    def __init__(self, emb_size=40, depth=6, n_classes=4, use_multiscale=False, dropout=0.5, use_tcn=False, use_pos_encoding=True, **kwargs):
+        """
+        EEG Conformer模型
+        
+        参数：
+            emb_size: 嵌入维度
+            depth: Transformer层数
+            n_classes: 分类类别数
+            use_multiscale: 是否使用多尺度卷积
+                - False: 单一kernel=25（基线，消融实验步骤1）
+                - True: 多尺度kernel=13,25,51（改进版，消融实验步骤3）
+            dropout: Dropout率（多尺度时建议0.6，基线0.5）
+            use_tcn: 是否使用TCN+Transformer混合架构
+                - False: 仅使用Transformer（默认）
+                - True: TCN+Transformer混合（消融实验步骤6）
+            use_pos_encoding: 是否使用时间位置编码
+                - True: 启用位置编码（默认，推荐）
+                - False: 禁用位置编码（消融实验用）
+        
+        消融实验使用说明：
+            步骤1（基线）: Conformer(use_multiscale=False, dropout=0.5, use_tcn=False, use_pos_encoding=True)
+            步骤3（+多尺度）: Conformer(use_multiscale=True, dropout=0.6, use_tcn=False, use_pos_encoding=True)
+            步骤6（+TCN）: Conformer(use_multiscale=True, dropout=0.6, use_tcn=True, use_pos_encoding=True)
+        """
+        super().__init__()
+        
+        self.use_tcn = use_tcn
+        self.use_pos_encoding = use_pos_encoding
+        self.patch_embed = PatchEmbedding(emb_size, use_multiscale=use_multiscale, dropout=dropout)
+        self.pos_encoding = TemporalPositionEncoding(emb_size, max_len=5000, scale=0.1) if use_pos_encoding else None
+        self.norm = nn.LayerNorm(emb_size)  # 归一化层，平衡特征和位置编码
+        
+        # 选择编码器类型
+        if use_tcn:
+            # TCN + Transformer混合
+            tcn_channels = [emb_size, emb_size, emb_size]
+            tcn_dropout = dropout * 0.4  # TCN使用较小的dropout
+            self.encoder = TCN_Transformer_Hybrid(
+                emb_size=emb_size, 
+                num_channels=tcn_channels,
+                depth=depth,
+                dropout=tcn_dropout
+            )
+        else:
+            # 仅Transformer
+            self.encoder = TransformerEncoder(depth, emb_size)
+        
+        self.classifier = ClassificationHead(emb_size, n_classes)
+    
+    def forward(self, x):
+        # 1. Patch Embedding: (B, 1, 22, 1024) -> (B, seq_len, emb_size)
+        x = self.patch_embed(x)
+        
+        # 2. 添加时间位置编码（缩放到10%强度）- 可选
+        if self.use_pos_encoding:
+            x = self.pos_encoding(x)
+        
+        # 3. LayerNorm归一化，平衡特征和位置信息
+        x = self.norm(x)
+        
+        # 4. 编码器（Transformer或TCN+Transformer）
+        x = self.encoder(x)
+        
+        # 5. 分类
+        features, logits = self.classifier(x)
+        
+        return features, logits
+
+
+class ExP():
+    def __init__(self, nsub):
+        super(ExP, self).__init__()
+        self.batch_size = 72
+        self.n_epochs = 2000
+        self.c_dim = 4
+        self.lr = 0.0002
+        self.b1 = 0.5
+        self.b2 = 0.999
+        self.dimension = (190, 50)
+        self.nSub = nsub
+
+        self.start_epoch = 0
+        self.root = '/Data/strict_TE/'
+
+        self.log_write = open("./results/log_subject%d.txt" % self.nSub, "w")
+
+
+        self.Tensor = torch.cuda.FloatTensor
+        self.LongTensor = torch.cuda.LongTensor
+
+        self.criterion_l1 = torch.nn.L1Loss().cuda()
+        self.criterion_l2 = torch.nn.MSELoss().cuda()
+        self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
+
+        self.model = Conformer().cuda()
+        self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
+        self.model = self.model.cuda()
+        # summary(self.model, (1, 22, 1000))
+
+
+    # Segmentation and Reconstruction (S&R) data augmentation
+    def interaug(self, timg, label):  
+        aug_data = []
+        aug_label = []
+        for cls4aug in range(4):
+            cls_idx = np.where(label == cls4aug + 1)
+            tmp_data = timg[cls_idx]
+            tmp_label = label[cls_idx]
+
+            tmp_aug_data = np.zeros((int(self.batch_size / 4), 1, 22, 1000))
+            for ri in range(int(self.batch_size / 4)):
+                for rj in range(8):
+                    rand_idx = np.random.randint(0, tmp_data.shape[0], 8)
+                    tmp_aug_data[ri, :, :, rj * 125:(rj + 1) * 125] = tmp_data[rand_idx[rj], :, :,
+                                                                      rj * 125:(rj + 1) * 125]
+
+            aug_data.append(tmp_aug_data)
+            aug_label.append(tmp_label[:int(self.batch_size / 4)])
+        aug_data = np.concatenate(aug_data)
+        aug_label = np.concatenate(aug_label)
+        aug_shuffle = np.random.permutation(len(aug_data))
+        aug_data = aug_data[aug_shuffle, :, :]
+        aug_label = aug_label[aug_shuffle]
+
+        aug_data = torch.from_numpy(aug_data).cuda()
+        aug_data = aug_data.float()
+        aug_label = torch.from_numpy(aug_label-1).cuda()
+        aug_label = aug_label.long()
+        return aug_data, aug_label
+
+    def get_source_data(self):
+        # ! please please recheck if you need validation set 
+        # ! and the data segement compared methods used
+
+        # train data
+        self.total_data = scipy.io.loadmat(self.root + 'A0%dT.mat' % self.nSub)
+        self.train_data = self.total_data['data']
+        self.train_label = self.total_data['label']
+
+        self.train_data = np.transpose(self.train_data, (2, 1, 0))
+        self.train_data = np.expand_dims(self.train_data, axis=1)
+        self.train_label = np.transpose(self.train_label)
+
+        self.allData = self.train_data
+        self.allLabel = self.train_label[0]
+
+        shuffle_num = np.random.permutation(len(self.allData))
+        self.allData = self.allData[shuffle_num, :, :, :]
+        self.allLabel = self.allLabel[shuffle_num]
+
+        # test data
+        self.test_tmp = scipy.io.loadmat(self.root + 'A0%dE.mat' % self.nSub)
+        self.test_data = self.test_tmp['data']
+        self.test_label = self.test_tmp['label']
+
+        self.test_data = np.transpose(self.test_data, (2, 1, 0))
+        self.test_data = np.expand_dims(self.test_data, axis=1)
+        self.test_label = np.transpose(self.test_label)
+
+        self.testData = self.test_data
+        self.testLabel = self.test_label[0]
+
+
+        # standardize
+        target_mean = np.mean(self.allData)
+        target_std = np.std(self.allData)
+        self.allData = (self.allData - target_mean) / target_std
+        self.testData = (self.testData - target_mean) / target_std
+
+        # data shape: (trial, conv channel, electrode channel, time samples)
+        return self.allData, self.allLabel, self.testData, self.testLabel
+
+
+    def train(self):
+
+        img, label, test_data, test_label = self.get_source_data()
+
+        img = torch.from_numpy(img)
+        label = torch.from_numpy(label - 1)
+
+        dataset = torch.utils.data.TensorDataset(img, label)
+        self.dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=self.batch_size, shuffle=True)
+
+        test_data = torch.from_numpy(test_data)
+        test_label = torch.from_numpy(test_label - 1)
+        test_dataset = torch.utils.data.TensorDataset(test_data, test_label)
+        self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size, shuffle=True)
+
+        # Optimizers
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
+
+        test_data = Variable(test_data.type(self.Tensor))
+        test_label = Variable(test_label.type(self.LongTensor))
+
+        bestAcc = 0
+        averAcc = 0
+        num = 0
+        Y_true = 0
+        Y_pred = 0
+
+        # Train the cnn model
+        total_step = len(self.dataloader)
+        curr_lr = self.lr
+
+        for e in range(self.n_epochs):
+            # in_epoch = time.time()
+            self.model.train()
+            for i, (img, label) in enumerate(self.dataloader):
+
+                img = Variable(img.cuda().type(self.Tensor))
+                label = Variable(label.cuda().type(self.LongTensor))
+
+                # data augmentation
+                aug_data, aug_label = self.interaug(self.allData, self.allLabel)
+                img = torch.cat((img, aug_data))
+                label = torch.cat((label, aug_label))
+
+
+                tok, outputs = self.model(img)
+
+                loss = self.criterion_cls(outputs, label) 
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+
+            # out_epoch = time.time()
+
+
+            # test process
+            if (e + 1) % 1 == 0:
+                self.model.eval()
+                Tok, Cls = self.model(test_data)
+
+
+                loss_test = self.criterion_cls(Cls, test_label)
+                y_pred = torch.max(Cls, 1)[1]
+                acc = float((y_pred == test_label).cpu().numpy().astype(int).sum()) / float(test_label.size(0))
+                train_pred = torch.max(outputs, 1)[1]
+                train_acc = float((train_pred == label).cpu().numpy().astype(int).sum()) / float(label.size(0))
+
+                print('Epoch:', e,
+                      '  Train loss: %.6f' % loss.detach().cpu().numpy(),
+                      '  Test loss: %.6f' % loss_test.detach().cpu().numpy(),
+                      '  Train accuracy %.6f' % train_acc,
+                      '  Test accuracy is %.6f' % acc)
+
+                self.log_write.write(str(e) + "    " + str(acc) + "\n")
+                num = num + 1
+                averAcc = averAcc + acc
+                if acc > bestAcc:
+                    bestAcc = acc
+                    Y_true = test_label
+                    Y_pred = y_pred
+
+
+        torch.save(self.model.module.state_dict(), 'model.pth')
+        averAcc = averAcc / num
+        print('The average accuracy is:', averAcc)
+        print('The best accuracy is:', bestAcc)
+        self.log_write.write('The average accuracy is: ' + str(averAcc) + "\n")
+        self.log_write.write('The best accuracy is: ' + str(bestAcc) + "\n")
+
+        return bestAcc, averAcc, Y_true, Y_pred
+        # writer.close()
+
+
+def main():
+    best = 0
+    aver = 0
+    result_write = open("./results/sub_result.txt", "w")
+
+    for i in range(9):
+        starttime = datetime.datetime.now()
+
+
+        seed_n = np.random.randint(2021)
+        print('seed is ' + str(seed_n))
+        random.seed(seed_n)
+        np.random.seed(seed_n)
+        torch.manual_seed(seed_n)
+        torch.cuda.manual_seed(seed_n)
+        torch.cuda.manual_seed_all(seed_n)
+
+
+        print('Subject %d' % (i+1))
+        exp = ExP(i + 1)
+
+        bestAcc, averAcc, Y_true, Y_pred = exp.train()
+        print('THE BEST ACCURACY IS ' + str(bestAcc))
+        result_write.write('Subject ' + str(i + 1) + ' : ' + 'Seed is: ' + str(seed_n) + "\n")
+        result_write.write('Subject ' + str(i + 1) + ' : ' + 'The best accuracy is: ' + str(bestAcc) + "\n")
+        result_write.write('Subject ' + str(i + 1) + ' : ' + 'The average accuracy is: ' + str(averAcc) + "\n")
+
+        endtime = datetime.datetime.now()
+        print('subject %d duration: '%(i+1) + str(endtime - starttime))
+        best = best + bestAcc
+        aver = aver + averAcc
+        if i == 0:
+            yt = Y_true
+            yp = Y_pred
+        else:
+            yt = torch.cat((yt, Y_true))
+            yp = torch.cat((yp, Y_pred))
+
+
+    best = best / 9
+    aver = aver / 9
+
+    result_write.write('**The average Best accuracy is: ' + str(best) + "\n")
+    result_write.write('The average Aver accuracy is: ' + str(aver) + "\n")
+    result_write.close()
+
+
+if __name__ == "__main__":
+    print(time.asctime(time.localtime(time.time())))
+    main()
+    print(time.asctime(time.localtime(time.time())))
