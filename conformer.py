@@ -62,7 +62,22 @@ cudnn.deterministic = True
 
 # writer = SummaryWriter('./TensorBoardX/')
 
+# class SEBlock(nn.Module):
+#     def __init__(self, channels, reduction=4): # reduction改小一点，效果更精细
+#         super().__init__()
+#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+#         self.fc = nn.Sequential(
+#             nn.Linear(channels, channels // reduction, bias=False),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(channels // reduction, channels, bias=False),
+#             nn.Sigmoid()
+#         )
 
+#     def forward(self, x):
+#         b, c, _, _ = x.size()
+#         y = self.avg_pool(x).view(b, c)
+#         y = self.fc(y).view(b, c, 1, 1)
+#         return x * y.expand_as(x)
 # Convolution module
 # use conv to capture local features, instead of postion embedding.
 class MultiScaleTemporalConv(nn.Module):
@@ -106,7 +121,17 @@ class MultiScaleTemporalConv(nn.Module):
             nn.BatchNorm2d(branch_channels + (out_channels % 3)),
             nn.ELU()
         )
-        
+        # ⭐ 替换：去掉 1x1 Conv，改用 SE-Block
+        # self.se_block = SEBlock(out_channels)
+
+        # ⭐ 改进的融合层
+        #self.fusion_block = nn.Sequential(
+        #    nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
+        #    nn.BatchNorm2d(out_channels),
+        #    nn.ELU(),       # 1. 必须加激活函数！
+        #    nn.Dropout(0.5) # 2. 防止过拟合
+        #)    
+
     def forward(self, x):
         # 并行提取3个尺度的特征
         short = self.short_conv(x)  # (B, 13, 22, T)
@@ -114,11 +139,75 @@ class MultiScaleTemporalConv(nn.Module):
         long = self.long_conv(x)    # (B, 14, 22, T)
         
         # 在通道维度拼接 → (B, 40, 22, T)
+        # x = torch.cat([short, mid, long], dim=1)
+        # out = self.se_block(x)  # 使用SE块增强特征
+        # return out
         return torch.cat([short, mid, long], dim=1)
+    #    concat_x = torch.cat([short, mid, long], dim=1)
+    #    fused_x = self.fusion_block(concat_x)
+    #    out = concat_x + fused_x
+    #    return out
+
+
+class ElectrodeAttention(nn.Module):
+    """
+    电极级注意力机制（基于SE-Block）
+    
+    作用于22个EEG电极维度，学习不同脑区的重要性。
+    例如：T7(颞叶)对颞叶癫痫的权重 > FP1(额叶)的权重
+    
+    参数：
+        num_electrodes: EEG电极数量（默认22）
+        reduction: 降维比例，控制瓶颈层大小（默认4，即22→5→22）
+    
+    输入形状：(B, C, E, T) = (B, 40, 22, T_variable)
+    输出形状：(B, C, E, T) = (B, 40, 22, T_variable)
+    """
+    def __init__(self, num_electrodes=22, reduction=4):
+        super().__init__()
+        self.num_electrodes = num_electrodes
+        
+        # Excitation: FC层学习电极权重
+        self.fc = nn.Sequential(
+            nn.Linear(num_electrodes, num_electrodes // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(num_electrodes // reduction, num_electrodes, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        """
+        前向传播
+        
+        x: (B, C, E, T) = (B, 40, 22, T)
+            B: batch size
+            C: 特征通道数（40个多尺度卷积特征）
+            E: 电极数（22个EEG电极）
+            T: 时间点数（可变）
+        
+        返回: (B, C, E, T) - 电极加权后的特征
+        """
+        b, c, e, t = x.shape
+        
+        # Squeeze: 对特征维度和时间维度做全局平均池化
+        # (B, 40, 22, T) -> (B, 22)
+        y = torch.mean(x, dim=[1, 3])  # 保留batch和电极维度
+        
+        # Excitation: 学习22个电极的重要性权重
+        # (B, 22) -> (B, 5) -> (B, 22)
+        y = self.fc(y)  # Sigmoid输出，范围[0, 1]
+        
+        # 重塑权重张量以便广播
+        # (B, 22) -> (B, 1, 22, 1)
+        y = y.view(b, 1, e, 1)
+        
+        # 将电极权重应用到所有特征通道和时间点
+        # (B, 1, 22, 1) 广播到 (B, 40, 22, T)
+        return x * y.expand_as(x)
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size=40, use_multiscale=False, dropout=0.5):
+    def __init__(self, emb_size=40, use_multiscale=False, dropout=0.5, use_electrode_attention=True):
         """
         Patch Embedding模块
         
@@ -128,9 +217,17 @@ class PatchEmbedding(nn.Module):
                 - False: 使用原始单一卷积（消融实验基线）
                 - True: 使用多尺度卷积（改进版本）
             dropout: Dropout率（多尺度时建议0.6，基线0.5）
+            use_electrode_attention: 是否使用电极注意力（默认True）
         """
         super().__init__()
         self.use_multiscale = use_multiscale
+        self.use_electrode_attention = use_electrode_attention
+        
+        # 电极注意力模块（在空间卷积前）
+        if use_electrode_attention:
+            self.electrode_attention = ElectrodeAttention(num_electrodes=22, reduction=4)
+        else:
+            self.electrode_attention = None
 
         if use_multiscale:
             # 改进版：多尺度时间卷积
@@ -145,11 +242,11 @@ class PatchEmbedding(nn.Module):
         else:
             # 原始版：单一卷积核
             self.shallownet = nn.Sequential(
-                nn.Conv2d(1, 40, (1, 25), (1, 1)),
+                nn.Conv2d(1, 40, (1, 32), (1, 1)),
                 nn.Conv2d(40, 40, (22, 1), (1, 1)),
                 nn.BatchNorm2d(40),
                 nn.ELU(),
-                nn.AvgPool2d((1, 75), (1, 7)),  # stride 10→7
+                nn.AvgPool2d((1, 75), (1, 5)),  # stride 10→7
                 nn.Dropout(dropout),  # 使用可配置dropout
             )
 
@@ -160,8 +257,47 @@ class PatchEmbedding(nn.Module):
 
 
     def forward(self, x: Tensor) -> Tensor:
+        """
+        前向传播（包含电极注意力）
+        
+        数据流：
+        (B,1,22,1024) -> MultiScaleConv -> (B,40,22,T)
+                      -> ElectrodeAttn -> (B,40,22,T) [电极加权]
+                      -> SpatialConv -> (B,40,1,T) [电极融合]
+                      -> BN+ELU+Pool+Dropout -> (B,40,1,T_reduced)
+                      -> Projection -> (B,seq_len,emb_size)
+        """
         b, _, _, _ = x.shape
-        x = self.shallownet(x)
+        
+        if self.use_multiscale:
+            # Step 1: 多尺度时间卷积
+            # 输入: (B, 1, 22, 1024)
+            # 输出: (B, 40, 22, T) - 22个电极维度保留
+            x = self.shallownet[0](x)  # MultiScaleTemporalConv
+            
+            # Step 2: 电极注意力（在空间卷积前）
+            # 输入: (B, 40, 22, T)
+            # 输出: (B, 40, 22, T) - 学习22个电极的重要性权重
+            if self.electrode_attention is not None:
+                x = self.electrode_attention(x)
+            
+            # Step 3-6: 空间卷积 + 后续处理
+            # 输入: (B, 40, 22, T)
+            # 输出: (B, 40, 1, T_reduced) - 电极融合 + 降采样
+            x = self.shallownet[1:](x)  # SpatialConv + BN + ELU + AvgPool + Dropout
+        else:
+            # 原始版本分支
+            # Step 1: 时间卷积
+            x = self.shallownet[0](x)
+            
+            # Step 2: 电极注意力（在空间卷积前）
+            if self.electrode_attention is not None:
+                x = self.electrode_attention(x)
+            
+            # Step 3-6: 空间卷积 + 后续处理
+            x = self.shallownet[1:](x)
+        
+        # Step 7: 投影到嵌入维度
         x = self.projection(x)
         return x
 
@@ -293,6 +429,78 @@ class TransformerEncoderBlock(nn.Sequential):
             ))
 
 
+class TemporalConvBlock(nn.Module):
+    """因果时间卷积块（保持时序因果性）"""
+    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        
+        self.net = nn.Sequential(
+            self.conv1,
+            nn.BatchNorm1d(n_outputs),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            self.conv2,
+            nn.BatchNorm1d(n_outputs),
+            nn.ELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.padding = padding
+        
+    def forward(self, x):
+        # 保存原始长度
+        original_len = x.size(2)
+        
+        # 通过网络
+        out = self.net(x)
+        
+        # 去除因padding引入的未来信息（保持因果性）
+        if self.padding > 0:
+            out = out[:, :, :-self.padding]
+        
+        # 裁剪到原始长度（避免累积长度变化）
+        out = out[:, :, :original_len]
+        
+        # 残差连接
+        res = x if self.downsample is None else self.downsample(x)
+        
+        return F.elu(out + res)
+
+
+class TCN_Transformer_Hybrid(nn.Module):
+    """TCN + Transformer混合架构"""
+    def __init__(self, emb_size=40, num_channels=[40, 40, 40], depth=6, dropout=0.2):
+        super().__init__()
+        
+        # TCN部分（局部时序建模）
+        layers = []
+        for i in range(len(num_channels)):
+            dilation = 2 ** i
+            in_channels = emb_size if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers.append(TemporalConvBlock(in_channels, out_channels, 
+                                           kernel_size=3, dilation=dilation, dropout=dropout))
+        self.tcn = nn.Sequential(*layers)
+        
+        # Transformer部分（全局时序建模）
+        self.transformer = nn.Sequential(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+        
+    def forward(self, x):
+        # x: (B, seq_len, emb_size)
+        x = x.permute(0, 2, 1)  # (B, emb_size, seq_len)
+        x = self.tcn(x)
+        x = x.permute(0, 2, 1)  # (B, seq_len, emb_size)
+        x = self.transformer(x)
+        return x
+
+
 class TransformerEncoder(nn.Sequential):
     def __init__(self, depth, emb_size):
         super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
@@ -337,7 +545,7 @@ class ClassificationHead(nn.Module):
 
 
 class Conformer(nn.Module):
-    def __init__(self, emb_size=40, depth=6, n_classes=4, use_multiscale=False, dropout=0.5, **kwargs):
+    def __init__(self, emb_size=40, depth=6, n_classes=4, use_multiscale=False, dropout=0.5, use_tcn=False, use_pos_encoding=True, use_electrode_attention=True, **kwargs):
         """
         EEG Conformer模型
         
@@ -349,31 +557,60 @@ class Conformer(nn.Module):
                 - False: 单一kernel=25（基线，消融实验步骤1）
                 - True: 多尺度kernel=13,25,51（改进版，消融实验步骤3）
             dropout: Dropout率（多尺度时建议0.6，基线0.5）
+            use_tcn: 是否使用TCN+Transformer混合架构
+                - False: 仅使用Transformer（默认）
+                - True: TCN+Transformer混合（消融实验步骤6）
+            use_pos_encoding: 是否使用时间位置编码
+                - True: 启用位置编码（默认，推荐）
+                - False: 禁用位置编码（消融实验用）
+            use_electrode_attention: 是否使用电极注意力机制
+                - True: 启用电极注意力（默认，推荐）
+                - False: 禁用电极注意力（消融实验用）
         
         消融实验使用说明：
-            步骤1（基线）: Conformer(use_multiscale=False, dropout=0.5)
-            步骤3（+多尺度）: Conformer(use_multiscale=True, dropout=0.6)
+            步骤1（基线）: Conformer(use_multiscale=False, dropout=0.5, use_tcn=False, use_pos_encoding=True, use_electrode_attention=False)
+            步骤3（+多尺度）: Conformer(use_multiscale=True, dropout=0.6, use_tcn=False, use_pos_encoding=True, use_electrode_attention=False)
+            步骤6（+TCN）: Conformer(use_multiscale=True, dropout=0.6, use_tcn=True, use_pos_encoding=True, use_electrode_attention=False)
+            步骤7（+电极注意力）: Conformer(use_multiscale=True, dropout=0.6, use_tcn=True, use_pos_encoding=True, use_electrode_attention=True)
         """
         super().__init__()
         
-        self.patch_embed = PatchEmbedding(emb_size, use_multiscale=use_multiscale, dropout=dropout)
-        self.pos_encoding = TemporalPositionEncoding(emb_size, max_len=5000, scale=0.1)
+        self.use_tcn = use_tcn
+        self.use_pos_encoding = use_pos_encoding
+        self.patch_embed = PatchEmbedding(emb_size, use_multiscale=use_multiscale, dropout=dropout, use_electrode_attention=use_electrode_attention)
+        self.pos_encoding = TemporalPositionEncoding(emb_size, max_len=5000, scale=0.1) if use_pos_encoding else None
         self.norm = nn.LayerNorm(emb_size)  # 归一化层，平衡特征和位置编码
-        self.transformer = TransformerEncoder(depth, emb_size)
+        
+        # 选择编码器类型
+        if use_tcn:
+            # TCN + Transformer混合
+            tcn_channels = [emb_size, emb_size, emb_size]
+            tcn_dropout = dropout * 0.4  # TCN使用较小的dropout
+            self.encoder = TCN_Transformer_Hybrid(
+                emb_size=emb_size, 
+                num_channels=tcn_channels,
+                depth=depth,
+                dropout=tcn_dropout
+            )
+        else:
+            # 仅Transformer
+            self.encoder = TransformerEncoder(depth, emb_size)
+        
         self.classifier = ClassificationHead(emb_size, n_classes)
     
     def forward(self, x):
         # 1. Patch Embedding: (B, 1, 22, 1024) -> (B, seq_len, emb_size)
         x = self.patch_embed(x)
         
-        # 2. 添加时间位置编码（缩放到10%强度）
-        x = self.pos_encoding(x)
+        # 2. 添加时间位置编码（缩放到10%强度）- 可选
+        if self.use_pos_encoding:
+            x = self.pos_encoding(x)
         
         # 3. LayerNorm归一化，平衡特征和位置信息
         x = self.norm(x)
         
-        # 4. Transformer编码
-        x = self.transformer(x)
+        # 4. 编码器（Transformer或TCN+Transformer）
+        x = self.encoder(x)
         
         # 5. 分类
         features, logits = self.classifier(x)
