@@ -1,0 +1,1130 @@
+#!/usr/bin/env python3
+"""
+EEG Conformer Training Script with Leave-One-Out Cross-Validation (LOOCV)
+for Epilepsy Seizure Prediction - 24 of 30 Post-processing Version
+
+基于 train_conformer_loocv_minimal.py 修改
+主要变更：将后处理策略从 4 of 9 改为 24 of 30
+
+后处理策略（24 of 30）：
+- 使用滑动窗口检测连续30个样本中至少有24个预测为发作前期则触发警报
+- 相比4 of 9，这是一个更保守的策略，要求更高的连续性
+
+Author: AI Assistant
+Date: 2025-10-23
+"""
+
+import os
+import sys
+import glob
+import random
+import datetime
+import time
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, 
+    roc_auc_score, confusion_matrix, classification_report
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# 导入现有的 Conformer 模型（不修改模型代码）
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from conformer import Conformer
+
+
+
+# ============================================================================
+# 从 train_conformer_loocv_minimal.py 复制的类和函数
+# ============================================================================
+
+class LegendDataParser:
+    """解析 legendAllData.txt 文件，获取每个患者的发作信息"""
+    
+    def __init__(self, legend_file_path):
+        self.legend_file_path = Path(legend_file_path)
+        self.patient_id = None
+        self.num_seizures = 0
+        self.interictal_files = []
+        self.preictal_seizure_map = {}  # seizure_id -> list of preictal files
+        self.parse()
+    
+    def parse(self):
+        """解析 legend 文件"""
+        with open(self.legend_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        current_section = None
+        current_seizure = None
+        temp_seizure_map = {}  # 临时存储所有发作数据
+        ignored_lines = []
+
+        for raw_line in lines:
+            # 先去除首尾空白
+            line = raw_line.strip()
+
+            # 忽略空行
+            if not line:
+                continue
+
+            # 忽略整行注释（以 # 开头）
+            if line.lstrip().startswith('#'):
+                ignored_lines.append((line, 'full_line_comment'))
+                continue
+
+            # 去掉行内注释（把 # 之后的内容去掉）
+            if '#' in line:
+                line = line.split('#', 1)[0].strip()
+                if not line:
+                    ignored_lines.append((raw_line.strip(), 'inline_comment_only'))
+                    continue
+
+            # 患者ID（两位数字）
+            if len(line) == 2 and line.isdigit():
+                self.patient_id = int(line)
+                continue
+
+            # 发作次数
+            if line.upper().startswith('SEIZURE:'):
+                try:
+                    self.num_seizures = int(line.split(':', 1)[1].strip())
+                except Exception:
+                    ignored_lines.append((line, 'bad_seizure_count'))
+                continue
+
+            # 发作间期部分
+            if line.upper() == 'INTERICTAL':
+                current_section = 'interictal'
+                continue
+
+            # 发作前期部分
+            if line.upper() == 'PREICTAL':
+                current_section = 'preictal'
+                continue
+
+            # 发作编号行，例如: SEIZURE 0
+            if line.upper().startswith('SEIZURE'):
+                parts = line.split()
+                # 如果只有一个 token，跳过
+                if len(parts) >= 2:
+                    try:
+                        current_seizure = int(parts[1])
+                        if current_seizure not in temp_seizure_map:
+                            temp_seizure_map[current_seizure] = []
+                    except Exception:
+                        ignored_lines.append((line, 'bad_seizure_id'))
+                else:
+                    ignored_lines.append((line, 'malformed_seizure_line'))
+                continue
+
+            # 尝试从行中提取 .npz 文件路径 token
+            if '.npz' in line:
+                parts = line.split()
+                # 找到第一个包含 .npz 的 token
+                file_token = None
+                for tok in parts:
+                    if '.npz' in tok:
+                        file_token = tok
+                        break
+
+                if file_token is None:
+                    ignored_lines.append((line, 'npz_not_found_after_split'))
+                    continue
+
+                # 标准化路径：确保以 '/' 开头的相对路径（脚本以前依赖这一点）
+                file_path = file_token
+                # 如果文件路径没有以 '/' 开头但包含 paz，则尝试加上
+                if not file_path.startswith('/') and 'paz' in file_path:
+                    file_path = '/' + file_path.lstrip('./')
+
+                if current_section == 'interictal':
+                    self.interictal_files.append(file_path)
+                elif current_section == 'preictal' and current_seizure is not None:
+                    temp_seizure_map[current_seizure].append(file_path)
+                else:
+                    # 既不是 INTERICTAL 也不是 PREICTAL，记录为被忽略的行
+                    ignored_lines.append((line, 'npz_outside_known_section'))
+                continue
+
+            # 如果到这里还未处理，记录为无法解析的行
+            ignored_lines.append((line, 'unparsed'))
+        
+        # 只保留有实际数据的发作（过滤掉空发作）
+        self.preictal_seizure_map = {
+            seizure_id: files 
+            for seizure_id, files in temp_seizure_map.items() 
+            if len(files) > 0
+        }
+        
+        # 输出过滤信息
+        empty_seizures = [sid for sid, files in temp_seizure_map.items() if len(files) == 0]
+        if empty_seizures:
+            print(f"  警告: 患者 {self.patient_id} 跳过了 {len(empty_seizures)} 个无数据的发作: {empty_seizures}")
+
+        # 打印被忽略/无法解析的行的统计（只在存在时打印）
+        if ignored_lines:
+            # 为避免过度输出，仅计数不同类别
+            from collections import Counter
+            reasons = [r for (_, r) in ignored_lines]
+            reason_counts = Counter(reasons)
+            reason_summary = ', '.join([f"{k}:{v}" for k, v in reason_counts.items()])
+            print(f"  注意: 在解析 {self.legend_file_path.name} 时有 {len(ignored_lines)} 行被忽略（分类: {reason_summary}）。")
+        
+        # 更新实际有效的发作次数
+        self.num_seizures = len(self.preictal_seizure_map)
+        print(f"  患者 {self.patient_id}: 共有 {self.num_seizures} 个有效发作")
+    
+    def get_seizure_indices(self):
+        """获取所有发作的索引列表"""
+        return sorted(self.preictal_seizure_map.keys())
+    
+    def split_interictal_for_loocv(self):
+        """
+        将发作间期数据分割为 N 个片段，每个片段对应一次发作
+        返回: dict {seizure_id: [interictal_file_list]}
+        """
+        n_seizures = len(self.preictal_seizure_map)
+        if n_seizures == 0:
+            return {}
+        
+        total_interictal = len(self.interictal_files)
+        segment_size = total_interictal // n_seizures
+        
+        interictal_segments = {}
+        seizure_indices = self.get_seizure_indices()
+        
+        for i, seizure_id in enumerate(seizure_indices):
+            start_idx = i * segment_size
+            # 最后一个片段包含剩余的所有文件
+            if i == n_seizures - 1:
+                end_idx = total_interictal
+            else:
+                end_idx = (i + 1) * segment_size
+            
+            interictal_segments[seizure_id] = self.interictal_files[start_idx:end_idx]
+        
+        return interictal_segments
+
+
+class EEGDatasetLOOCV(Dataset):
+    """
+    用于留一交叉验证的EEG数据集
+    加载指定的文件列表并分配标签
+    【修改点】：增加返回文件路径
+    """
+    
+    def __init__(self, data_dir, file_list, labels):
+        """
+        Args:
+            data_dir: 数据根目录
+            file_list: 文件路径列表（相对路径）
+            labels: 对应的标签列表 (0=发作间期, 1=发作前期)
+        """
+        self.data_dir = Path(data_dir)
+        self.file_list = file_list
+        self.labels = labels
+        
+        assert len(file_list) == len(labels), "文件数量与标签数量不匹配"
+    
+    def __len__(self):
+        return len(self.file_list)
+    
+    def __getitem__(self, idx):
+        # 获取文件路径（移除开头的'/'）
+        file_path = self.file_list[idx].lstrip('/')
+        full_path = self.data_dir / file_path
+        label = self.labels[idx]
+        
+        try:
+            # 加载 NPZ 文件
+            with np.load(full_path, allow_pickle=True) as data:
+                if 'data' in data:
+                    eeg_data = data['data']
+                else:
+                    # 如果没有'data'键，尝试其他可能的键
+                    keys = list(data.keys())
+                    eeg_data = data[keys[0]]
+                
+                # 确保数据形状为 (16, 1, 22, 1024)
+                if eeg_data.shape[0] != 16:
+                    if eeg_data.shape[0] < 16:
+                        # 填充到16个片段
+                        padding_needed = 16 - eeg_data.shape[0]
+                        padding = np.zeros((padding_needed, 1, 22, 1024), dtype=eeg_data.dtype)
+                        eeg_data = np.concatenate([eeg_data, padding], axis=0)
+                    else:
+                        # 截断到16个片段
+                        eeg_data = eeg_data[:16]
+                
+                # 转换为 torch 张量
+                eeg_data = torch.FloatTensor(eeg_data)
+                label = torch.LongTensor([label])
+                
+                # 【修改点】：返回文件路径
+                return eeg_data, label, str(full_path)
+                
+        except Exception as e:
+            print(f"警告: 无法加载文件 {full_path}: {e}")
+            # 返回零数据和标签
+            eeg_data = torch.zeros(16, 1, 22, 1024)
+            label = torch.LongTensor([label])
+            return eeg_data, label, str(full_path)
+
+
+# ============================================================================
+# 【修改点】：24 of 30 后处理函数
+# ============================================================================
+
+def apply_24of30_postprocessing(predictions, threshold=0.5):
+    """
+    应用 24 of 30 后处理策略
+    
+    Args:
+        predictions: 预测概率数组 (N,)
+        threshold: 分类阈值
+    
+    Returns:
+        alarms: 触发警报的位置列表（索引）
+    """
+    n = len(predictions)
+    alarms = []
+    window_size = 25  # 【修改】：从9改为30
+    required_positives = 20  # 【修改】：从4改为24
+    
+    # 将概率转换为二值预测
+    binary_preds = (predictions > threshold).astype(int)
+    
+    # 滑动窗口
+    for i in range(n - window_size + 1):
+        window = binary_preds[i:i + window_size]
+        if np.sum(window) >= required_positives:
+            # 触发警报，记录窗口的中心位置
+            alarm_position = i + window_size // 2
+            if not alarms or alarm_position > alarms[-1] + window_size:
+                # 避免重复计数相近的警报
+                alarms.append(alarm_position)
+    
+    return alarms
+
+
+def calculate_sensitivity_fpr(preictal_predictions, interictal_predictions, 
+                               seconds_per_sample=30, threshold=0.5):
+    """
+    计算 Sensitivity、Specificity 和 FPR（每小时误报率）
+    
+    使用 24 of 30 后处理策略
+    
+    Sensitivity 计算方式：样本级别
+    - TP: 发作前期中被正确预测为阳性的样本数
+    - FN: 发作前期中被错误预测为阴性的样本数
+    - Sensitivity = TP / (TP + FN)
+    
+    Specificity 计算方式：样本级别
+    - TN: 发作间期中被正确预测为阴性的样本数
+    - FP: 发作间期中被错误预测为阳性的样本数
+    - Specificity = TN / (TN + FP)
+    
+    Args:
+        preictal_predictions: 发作前期预测概率 (N,)
+        interictal_predictions: 发作间期预测概率 (M,)
+        seconds_per_sample: 每个样本对应的时间（秒）
+        threshold: 分类阈值
+    
+    Returns:
+        sensitivity: 真阳性率 TP/(TP+FN)
+        specificity: 真阴性率 TN/(TN+FP)
+        fpr: 每小时误报率 (警报次数/发作间期总小时数)
+        tp: 真阳性计数（样本级别）
+        tn: 真阴性计数（样本级别）
+        fp: 假阳性计数（样本级别）
+        fn: 假阴性计数（样本级别）
+    """
+    # 【修改】：使用24 of 30后处理计算FPR（警报次数）
+    interictal_alarms = apply_24of30_postprocessing(interictal_predictions, threshold)
+    
+    # 发作间期样本级别的 TN 和 FP
+    # TN: 发作间期中预测为阴性的样本数
+    tn = np.sum(interictal_predictions <= threshold)
+    # FP: 发作间期中预测为阳性的样本数
+    fp_samples = np.sum(interictal_predictions > threshold)
+    
+    # 发作前期样本级别的 TP 和 FN
+    # TP: 发作前期中预测为阳性的样本数
+    tp = np.sum(preictal_predictions > threshold)
+    # FN: 发作前期中预测为阴性的样本数
+    fn = np.sum(preictal_predictions <= threshold)
+    
+    # 计算敏感性（样本级别）
+    if tp + fn > 0:
+        sensitivity = tp / (tp + fn)
+    else:
+        sensitivity = 0.0
+    
+    # 计算特异性（样本级别）
+    if tn + fp_samples > 0:
+        specificity = tn / (tn + fp_samples)
+    else:
+        specificity = 0.0
+    
+    # 计算 FPR（每小时误报率，基于警报次数）
+    total_interictal_seconds = len(interictal_predictions) * seconds_per_sample
+    total_interictal_hours = total_interictal_seconds / 3600.0
+    
+    fp_alarms = len(interictal_alarms)  # 警报次数
+    if total_interictal_hours > 0:
+        fpr = fp_alarms / total_interictal_hours
+    else:
+        fpr = 0.0
+    
+    return sensitivity, specificity, fpr, tp, tn, fp_samples, fn
+
+
+# ============================================================================
+# 继续复制其余代码（训练器类和主函数）
+# 只需要修改输出信息中的 "4 of 9" 为 "24 of 30"
+# ============================================================================
+
+class ConformerTrainerLOOCV:
+    """
+    带留一交叉验证的 Conformer 训练器
+    【修改点】：使用24 of 30后处理策略
+    """
+    
+    def __init__(self, data_dir="./conformer_processed_data", 
+                 results_dir="./results_loocv_24of30", 
+                 device=None,
+                 use_multiscale=True,
+                 use_tcn=False,
+                 use_pos_encoding=True,
+                 use_electrode_attention=True):
+        """
+        初始化 ConformerTrainerLOOCV
+        
+        参数：
+            data_dir (str): 数据目录路径
+            results_dir (str): 结果保存目录
+            device (torch.device): 计算设备
+            use_multiscale (bool): 是否使用多尺度卷积
+                - False: 单一卷积核 (基线)
+                - True: 多尺度卷积 (改进版)
+            use_tcn (bool): 是否使用TCN+Transformer混合架构
+                - False: 仅Transformer (默认)
+                - True: TCN+Transformer (消融实验步骤6)
+            use_pos_encoding (bool): 是否使用时间位置编码
+                - True: 启用位置编码 (默认，推荐)
+                - False: 禁用位置编码 (消融实验用)
+            use_electrode_attention (bool): 是否使用电极注意力机制
+                - True: 启用电极注意力 (默认，推荐)
+                - False: 禁用电极注意力 (消融实验用)
+        """
+        self.data_dir = Path(data_dir)
+        self.results_dir = Path(results_dir)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 模型配置
+        self.use_multiscale = use_multiscale
+        self.use_tcn = use_tcn
+        self.use_pos_encoding = use_pos_encoding
+        self.use_electrode_attention = use_electrode_attention
+        
+        # 训练参数（根据模型配置动态调整）
+        if use_multiscale:
+            # 多尺度卷积需要更强的正则化和更谨慎的训练
+            self.batch_size = 16
+            self.learning_rate = 5e-5  # 降低学习率，避免过拟合
+            self.weight_decay = 1e-4   # 添加L2正则化
+            self.num_epochs = 80       # 增加训练轮数，配合更低学习率
+            self.patience = 8          # 更激进的早停
+            self.dropout = 0.6         # 提高dropout率
+        else:
+            # 基线模型使用原始参数
+            self.batch_size = 16
+            self.learning_rate = 1e-4
+            self.weight_decay = 0      # 不使用L2正则化
+            self.num_epochs = 50
+            self.patience = 10
+            self.dropout = 0.5
+        
+        # TCN需要更长的训练时间
+        if use_tcn:
+            self.num_epochs = int(self.num_epochs * 1.2)  # 增加20%训练轮数
+        
+        self.val_split = 0.2  # 训练集中用于验证的比例
+        
+        # 结果存储
+        self.patient_results = {}
+        
+    def _create_model(self, use_multiscale=False, use_tcn=False, use_pos_encoding=True, use_electrode_attention=True):
+        """
+        创建 Conformer 模型
+        
+        参数：
+            use_multiscale (bool): 是否使用多尺度卷积
+                - False: 使用单一卷积核 kernel=25 (baseline)
+                - True: 使用多尺度卷积 kernel=13,25,51 (改进版)
+            use_tcn (bool): 是否使用TCN+Transformer混合
+            use_pos_encoding (bool): 是否使用时间位置编码
+            use_electrode_attention (bool): 是否使用电极注意力机制
+        
+        消融实验顺序：
+            步骤1: use_multiscale=False, use_tcn=False, use_pos_encoding=True (基线)
+            步骤3: use_multiscale=True, use_tcn=False, use_pos_encoding=True (多尺度)
+            步骤6: use_multiscale=True, use_tcn=True, use_pos_encoding=True (TCN混合)
+            步骤7: use_electrode_attention=True (电极注意力)
+        """
+        model = Conformer(
+            emb_size=40, 
+            depth=6, 
+            n_classes=2, 
+            use_multiscale=use_multiscale,              # 控制是否使用多尺度卷积
+            dropout=self.dropout,                       # 根据模型配置动态设置的dropout率
+            use_tcn=use_tcn,                            # 控制是否使用TCN+Transformer混合
+            use_pos_encoding=use_pos_encoding,          # 控制是否使用位置编码
+            use_electrode_attention=use_electrode_attention  # 控制是否使用电极注意力
+        )
+        
+        # 打印模型配置信息
+        print(f"\n{'='*60}")
+        print(f"模型配置:")
+        print(f"  - 嵌入维度 (emb_size): 40")
+        print(f"  - Transformer层数 (depth): 6")
+        print(f"  - 分类类别数 (n_classes): 2")
+        print(f"  - 多尺度卷积 (use_multiscale): {use_multiscale}")
+        print(f"  - TCN混合 (use_tcn): {use_tcn}")
+        print(f"  - 位置编码 (use_pos_encoding): {'启用 (scale=0.1)' if use_pos_encoding else '禁用'}")
+        print(f"  - 电极注意力 (use_electrode_attention): {'启用 (SE-Block, reduction=4)' if use_electrode_attention else '禁用'}")
+        print(f"  - LayerNorm: 启用")
+        if use_multiscale:
+            print(f"  - 卷积核大小: 13, 25, 51 (多尺度)")
+            print(f"  - Dropout率: 0.6 (增强正则化)")
+            print(f"  - L2正则化: weight_decay=1e-4")
+        else:
+            print(f"  - 卷积核大小: 25 (单一尺度)")
+            print(f"  - Dropout率: 0.5 (标准)")
+            print(f"  - L2正则化: 无")
+        if use_tcn:
+            print(f"  - 编码器: TCN (3层, dilation=1,2,4) + Transformer")
+        else:
+            print(f"  - 编码器: Transformer仅")
+        print(f"{'='*60}\n")
+        
+        return model.to(self.device)
+    
+    def _prepare_loocv_data(self, legend_parser, test_seizure_id):
+        """准备留一交叉验证的数据集"""
+        # 获取发作间期分段
+        interictal_segments = legend_parser.split_interictal_for_loocv()
+        
+        # 测试集：第 test_seizure_id 个发作的发作前期 + 对应的发作间期
+        test_preictal_files = legend_parser.preictal_seizure_map[test_seizure_id]
+        test_interictal_files = interictal_segments[test_seizure_id]
+        
+        test_files = test_interictal_files + test_preictal_files
+        test_labels = [0] * len(test_interictal_files) + [1] * len(test_preictal_files)
+        
+        # 训练集：其他所有发作的数据
+        train_interictal_files = []
+        train_preictal_files = []
+        
+        for seizure_id in legend_parser.get_seizure_indices():
+            if seizure_id != test_seizure_id:
+                train_interictal_files.extend(interictal_segments[seizure_id])
+                train_preictal_files.extend(legend_parser.preictal_seizure_map[seizure_id])
+        
+        # 从训练集中分出验证集（20% 发作间期 + 20% 发作前期）
+        n_val_interictal = int(len(train_interictal_files) * self.val_split)
+        n_val_preictal = int(len(train_preictal_files) * self.val_split)
+        
+        # 随机打乱
+        random.shuffle(train_interictal_files)
+        random.shuffle(train_preictal_files)
+        
+        val_interictal_files = train_interictal_files[:n_val_interictal]
+        val_preictal_files = train_preictal_files[:n_val_preictal]
+        
+        train_interictal_files = train_interictal_files[n_val_interictal:]
+        train_preictal_files = train_preictal_files[n_val_preictal:]
+        
+        # 创建训练集
+        train_files = train_interictal_files + train_preictal_files
+        train_labels = [0] * len(train_interictal_files) + [1] * len(train_preictal_files)
+        
+        # 创建验证集
+        val_files = val_interictal_files + val_preictal_files
+        val_labels = [0] * len(val_interictal_files) + [1] * len(val_preictal_files)
+        
+        # 打乱训练集和验证集
+        train_indices = list(range(len(train_files)))
+        random.shuffle(train_indices)
+        train_files = [train_files[i] for i in train_indices]
+        train_labels = [train_labels[i] for i in train_indices]
+        
+        val_indices = list(range(len(val_files)))
+        random.shuffle(val_indices)
+        val_files = [val_files[i] for i in val_indices]
+        val_labels = [val_labels[i] for i in val_indices]
+        
+        # 创建数据集
+        train_dataset = EEGDatasetLOOCV(self.data_dir, train_files, train_labels)
+        val_dataset = EEGDatasetLOOCV(self.data_dir, val_files, val_labels)
+        test_dataset = EEGDatasetLOOCV(self.data_dir, test_files, test_labels)
+        
+        # 创建数据加载器
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, 
+                                  shuffle=True, num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, 
+                               shuffle=False, num_workers=0, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, 
+                                 shuffle=False, num_workers=0, pin_memory=True)
+        
+        print(f"  训练集: {len(train_dataset)} 样本 (发作间期: {len(train_interictal_files)}, 发作前期: {len(train_preictal_files)})")
+        print(f"  验证集: {len(val_dataset)} 样本 (发作间期: {len(val_interictal_files)}, 发作前期: {len(val_preictal_files)})")
+        print(f"  测试集: {len(test_dataset)} 样本 (发作间期: {len(test_interictal_files)}, 发作前期: {len(test_preictal_files)})")
+        
+        return train_loader, val_loader, test_loader, len(test_interictal_files), len(test_preictal_files)
+    
+    def _train_epoch(self, model, train_loader, criterion, optimizer, epoch):
+        """训练一个epoch"""
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}')
+        
+        for batch_data, batch_labels, _ in progress_bar:
+            # 重塑数据: (batch_size, 16, 1, 22, 1024) -> (batch_size*16, 1, 22, 1024)
+            batch_size, n_segments = batch_data.shape[:2]
+            batch_data = batch_data.view(-1, 1, 22, 1024)
+            batch_labels = batch_labels.view(-1).repeat_interleave(n_segments)
+            
+            batch_data = batch_data.to(self.device)
+            batch_labels = batch_labels.to(self.device)
+            
+            optimizer.zero_grad()
+            
+            # 前向传播
+            _, outputs = model(batch_data)
+            loss = criterion(outputs, batch_labels)
+            
+            # 反向传播
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            predictions = torch.argmax(outputs, dim=1)
+            correct += (predictions == batch_labels).sum().item()
+            total += batch_labels.size(0)
+            
+            # 更新进度条
+            progress_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{100.*correct/total:.2f}%'
+            })
+        
+        avg_loss = total_loss / len(train_loader)
+        accuracy = 100. * correct / total
+        
+        return avg_loss, accuracy
+    
+    def _validate(self, model, val_loader, criterion):
+        """验证模型"""
+        model.eval()
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
+        all_probabilities = []
+        
+        with torch.no_grad():
+            for batch_data, batch_labels, _ in val_loader:
+                # 重塑数据
+                batch_size, n_segments = batch_data.shape[:2]
+                batch_data = batch_data.view(-1, 1, 22, 1024)
+                batch_labels = batch_labels.view(-1).repeat_interleave(n_segments)
+                
+                batch_data = batch_data.to(self.device)
+                batch_labels = batch_labels.to(self.device)
+                
+                # 前向传播
+                _, outputs = model(batch_data)
+                loss = criterion(outputs, batch_labels)
+                
+                total_loss += loss.item()
+                
+                # 存储预测和标签
+                probabilities = F.softmax(outputs, dim=1)
+                predictions = torch.argmax(outputs, dim=1)
+                
+                all_probabilities.extend(probabilities[:, 1].cpu().numpy())
+                all_predictions.extend(predictions.cpu().numpy())
+                all_labels.extend(batch_labels.cpu().numpy())
+        
+        avg_loss = total_loss / len(val_loader)
+        
+        return avg_loss, np.array(all_predictions), np.array(all_labels), np.array(all_probabilities)
+    
+    def _test_with_postprocessing(self, model, test_loader, n_interictal, n_preictal, 
+                                   patient_id=None, fold_idx=None):
+        """测试模型并应用24 of 30后处理"""
+        model.eval()
+        all_probabilities = []
+        all_labels = []
+        all_file_paths = []
+        
+        with torch.no_grad():
+            for batch_data, batch_labels, file_paths in test_loader:
+                # 重塑数据
+                batch_size, n_segments = batch_data.shape[:2]
+                batch_data = batch_data.view(-1, 1, 22, 1024)
+                batch_labels = batch_labels.view(-1).repeat_interleave(n_segments)
+                
+                batch_data = batch_data.to(self.device)
+                batch_labels = batch_labels.to(self.device)
+                
+                # 前向传播
+                _, outputs = model(batch_data)
+                
+                # 存储预测
+                probabilities = F.softmax(outputs, dim=1)
+                all_probabilities.extend(probabilities[:, 1].cpu().numpy())
+                all_labels.extend(batch_labels.cpu().numpy())
+                
+                # 记录文件路径
+                for fp in file_paths:
+                    all_file_paths.extend([fp] * 16)
+        
+        all_probabilities = np.array(all_probabilities)
+        all_labels = np.array(all_labels)
+        
+        # 保存预测结果
+        if patient_id is not None and fold_idx is not None:
+            self._save_predictions_to_csv(
+                all_file_paths, all_labels, all_probabilities,
+                n_interictal, patient_id, fold_idx
+            )
+        
+        # 分离发作间期和发作前期的预测
+        total_interictal_samples = n_interictal * 16
+        
+        interictal_probs = all_probabilities[:total_interictal_samples]
+        preictal_probs = all_probabilities[total_interictal_samples:]
+        
+        # 应用24 of 30后处理并计算指标
+        sensitivity, specificity, fpr, tp, tn, fp, fn = calculate_sensitivity_fpr(
+            preictal_probs, interictal_probs, 
+            seconds_per_sample=30
+        )
+        
+        # 计算基本分类指标
+        predictions = (all_probabilities > 0.5).astype(int)
+        accuracy = accuracy_score(all_labels, predictions)
+        precision = precision_score(all_labels, predictions, average='binary', zero_division=0)
+        recall = recall_score(all_labels, predictions, average='binary', zero_division=0)
+        f1 = f1_score(all_labels, predictions, average='binary', zero_division=0)
+        
+        if len(np.unique(all_labels)) == 2:
+            auc = roc_auc_score(all_labels, all_probabilities)
+        else:
+            auc = 0.0
+        
+        metrics_dict = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'auc': auc,
+            'sensitivity': sensitivity,
+            'specificity': specificity,
+            'fpr': fpr,
+            'tp': tp,
+            'tn': tn,
+            'fp': fp,
+            'fn': fn
+        }
+        
+        return interictal_probs, preictal_probs, sensitivity, specificity, fpr, metrics_dict
+    
+    def _save_predictions_to_csv(self, file_paths, labels, probabilities, 
+                                  n_interictal, patient_id, fold_idx):
+        """保存预测结果到CSV文件"""
+        file_predictions = []
+        
+        # 获取唯一文件列表
+        unique_files = []
+        seen = set()
+        for fp in file_paths:
+            if fp not in seen:
+                unique_files.append(fp)
+                seen.add(fp)
+        
+        # 为每个文件聚合16个片段的预测
+        for i, file_path in enumerate(unique_files):
+            start_idx = i * 16
+            end_idx = start_idx + 16
+            
+            file_probs = probabilities[start_idx:end_idx]
+            file_labels = labels[start_idx:end_idx]
+            
+            avg_prob = np.mean(file_probs)
+            prediction = 1 if avg_prob > 0.5 else 0
+            true_label = file_labels[0]
+            
+            is_error = (prediction != true_label)
+            
+            if i < n_interictal:
+                data_type = 'interictal'
+            else:
+                data_type = 'preictal'
+            
+            error_type = ''
+            if is_error:
+                if true_label == 0:
+                    error_type = 'FP (假阳性)'
+                else:
+                    error_type = 'FN (假阴性)'
+            
+            file_predictions.append({
+                'file_path': file_path,
+                'data_type': data_type,
+                'true_label': true_label,
+                'predicted_label': prediction,
+                'probability': avg_prob,
+                'is_error': is_error,
+                'error_type': error_type
+            })
+        
+        df = pd.DataFrame(file_predictions)
+        
+        patient_results_dir = self.results_dir / f"patient_{patient_id:02d}"
+        patient_results_dir.mkdir(parents=True, exist_ok=True)
+        
+        csv_path = patient_results_dir / f"predictions_fold_{fold_idx+1}.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"  ✅ 预测结果已保存: {csv_path}")
+        
+        errors_df = df[df['is_error'] == True]
+        if len(errors_df) > 0:
+            error_csv_path = patient_results_dir / f"errors_fold_{fold_idx+1}.csv"
+            errors_df.to_csv(error_csv_path, index=False)
+            print(f"  ✅ 错误预测已保存: {error_csv_path} (共 {len(errors_df)} 个错误)")
+    
+    def train_patient_loocv(self, patient_id):
+        """对单个患者进行留一交叉验证训练"""
+        print(f"\n{'='*80}")
+        print(f"患者 {patient_id:02d} - 留一交叉验证训练 (24 of 30后处理)")
+        print(f"{'='*80}")
+        
+        patient_dir = self.data_dir / f"paz{patient_id:02d}"
+        legend_file = patient_dir / "legendAllData.txt"
+        
+        if not legend_file.exists():
+            print(f"错误: 找不到 {legend_file}")
+            return None
+        
+        try:
+            legend_parser = LegendDataParser(legend_file)
+            print(f"患者 {patient_id:02d}: 发作次数 = {legend_parser.num_seizures}")
+            print(f"  发作间期文件数: {len(legend_parser.interictal_files)}")
+            print(f"  发作前期发作映射: {len(legend_parser.preictal_seizure_map)} 个发作")
+        except Exception as e:
+            print(f"错误: 解析 legend 文件失败: {e}")
+            return None
+        
+        seizure_indices = legend_parser.get_seizure_indices()
+        if len(seizure_indices) == 0:
+            print(f"错误: 患者 {patient_id:02d} 没有发作数据")
+            return None
+        
+        patient_results_dir = self.results_dir / f"patient_{patient_id:02d}"
+        patient_results_dir.mkdir(parents=True, exist_ok=True)
+        
+        fold_results = []
+        
+        for fold_idx, test_seizure_id in enumerate(seizure_indices):
+            print(f"\n{'-'*60}")
+            print(f"Fold {fold_idx+1}/{len(seizure_indices)}: 测试发作 {test_seizure_id}")
+            print(f"{'-'*60}")
+            
+            # 为每个fold设置独立的随机种子
+            fold_seed = 42 + fold_idx
+            random.seed(fold_seed)
+            np.random.seed(fold_seed)
+            torch.manual_seed(fold_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(fold_seed)
+            
+            train_loader, val_loader, test_loader, n_test_interictal, n_test_preictal = \
+                self._prepare_loocv_data(legend_parser, test_seizure_id)
+            
+            model = self._create_model(
+                use_multiscale=self.use_multiscale, 
+                use_tcn=self.use_tcn, 
+                use_pos_encoding=self.use_pos_encoding,
+                use_electrode_attention=self.use_electrode_attention
+            )
+            
+            # 使用标准的交叉熵损失函数
+            criterion = nn.CrossEntropyLoss()
+            
+            # 优化器配置（多尺度使用L2正则化）
+            optimizer = optim.Adam(
+                model.parameters(), 
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay  # L2正则化，防止过拟合
+            )
+            
+            # 学习率调度器（多尺度使用更保守的策略）
+            scheduler_patience = 4 if self.use_multiscale else 5
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 'min', 
+                patience=scheduler_patience, 
+                factor=0.5
+            )
+            
+            best_val_loss = float('inf')
+            patience_counter = 0
+            best_model_state = None
+            
+            for epoch in range(self.num_epochs):
+                train_loss, train_acc = self._train_epoch(model, train_loader, criterion, optimizer, epoch)
+                val_loss, predictions, labels, probabilities = self._validate(model, val_loader, criterion)
+                scheduler.step(val_loss)
+                
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    best_model_state = model.state_dict().copy()
+                else:
+                    patience_counter += 1
+                
+                if (epoch + 1) % 5 == 0 or epoch == 0:
+                    val_acc = accuracy_score(labels, predictions) * 100
+                    print(f"  Epoch {epoch+1}/{self.num_epochs}: "
+                          f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, "
+                          f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}%")
+                
+                if patience_counter >= self.patience:
+                    print(f"  早停触发于 Epoch {epoch+1}")
+                    break
+            
+            model.load_state_dict(best_model_state)
+            
+            interictal_probs, preictal_probs, sensitivity, specificity, fpr, test_metrics = \
+                self._test_with_postprocessing(model, test_loader, n_test_interictal, n_test_preictal,
+                                               patient_id=patient_id, fold_idx=fold_idx)
+            
+            print(f"\n  Fold {fold_idx+1} 测试结果:")
+            print(f"    准确率: {test_metrics['accuracy']*100:.2f}%")
+            print(f"    AUC: {test_metrics['auc']:.4f}")
+            print(f"    Sensitivity (24 of 30): {test_metrics['sensitivity']:.4f}")
+            print(f"    Specificity (24 of 30): {test_metrics['specificity']:.4f}")
+            print(f"    FPR (24 of 30): {test_metrics['fpr']:.4f} 次/小时")
+            print(f"    TP={test_metrics['tp']}, TN={test_metrics['tn']}, FP={test_metrics['fp']}, FN={test_metrics['fn']}")
+            
+            model_path = patient_results_dir / f"model_fold_{fold_idx+1}_seizure_{test_seizure_id}.pth"
+            torch.save(model.state_dict(), model_path)
+            
+            np.save(patient_results_dir / f"interictal_probs_fold_{fold_idx+1}.npy", interictal_probs)
+            np.save(patient_results_dir / f"preictal_probs_fold_{fold_idx+1}.npy", preictal_probs)
+            
+            fold_result = {
+                'fold': fold_idx + 1,
+                'test_seizure_id': test_seizure_id,
+                **test_metrics
+            }
+            fold_results.append(fold_result)
+        
+        # 计算平均指标
+        avg_metrics = {}
+        for key in ['accuracy', 'precision', 'recall', 'f1', 'auc', 'sensitivity', 'specificity', 'fpr']:
+            values = [r[key] for r in fold_results]
+            avg_metrics[f'avg_{key}'] = np.mean(values)
+            avg_metrics[f'std_{key}'] = np.std(values)
+        
+        print(f"\n{'='*80}")
+        print(f"患者 {patient_id:02d} - 留一交叉验证总结 (24 of 30)")
+        print(f"{'='*80}")
+        print(f"平均准确率: {avg_metrics['avg_accuracy']*100:.2f}% ± {avg_metrics['std_accuracy']*100:.2f}%")
+        print(f"平均 AUC: {avg_metrics['avg_auc']:.4f} ± {avg_metrics['std_auc']:.4f}")
+        print(f"平均 Sensitivity (24 of 30): {avg_metrics['avg_sensitivity']:.4f} ± {avg_metrics['std_sensitivity']:.4f}")
+        print(f"平均 Specificity (24 of 30): {avg_metrics['avg_specificity']:.4f} ± {avg_metrics['std_specificity']:.4f}")
+        print(f"平均 FPR (24 of 30): {avg_metrics['avg_fpr']:.4f} ± {avg_metrics['std_fpr']:.4f} 次/小时")
+        
+        results_df = pd.DataFrame(fold_results)
+        results_df.to_csv(patient_results_dir / "fold_results.csv", index=False)
+        
+        summary_df = pd.DataFrame([avg_metrics])
+        summary_df.to_csv(patient_results_dir / "summary_results.csv", index=False)
+        
+        self._plot_patient_results(patient_id, fold_results, avg_metrics, patient_results_dir)
+        
+        return {
+            'patient_id': patient_id,
+            'fold_results': fold_results,
+            'avg_metrics': avg_metrics
+        }
+    
+    def _plot_patient_results(self, patient_id, fold_results, avg_metrics, save_dir):
+        """绘制患者的训练结果图表"""
+        folds = [r['fold'] for r in fold_results]
+        accuracies = [r['accuracy'] * 100 for r in fold_results]
+        sensitivities = [r['sensitivity'] for r in fold_results]
+        specificities = [r['specificity'] for r in fold_results]
+        fprs = [r['fpr'] for r in fold_results]
+        aucs = [r['auc'] for r in fold_results]
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Accuracy
+        axes[0, 0].bar(folds, accuracies, alpha=0.7, color='steelblue')
+        axes[0, 0].axhline(y=avg_metrics['avg_accuracy']*100, color='r', linestyle='--', 
+                          label=f'Average: {avg_metrics["avg_accuracy"]*100:.2f}%')
+        axes[0, 0].set_title(f'Accuracy Across Folds - Patient {patient_id:02d}')
+        axes[0, 0].set_xlabel('Fold')
+        axes[0, 0].set_ylabel('Accuracy (%)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Sensitivity
+        axes[0, 1].bar(folds, sensitivities, alpha=0.7, color='green')
+        axes[0, 1].axhline(y=avg_metrics['avg_sensitivity'], color='r', linestyle='--',
+                          label=f'Average: {avg_metrics["avg_sensitivity"]:.4f}')
+        axes[0, 1].set_title(f'Sensitivity (24 of 30) - Patient {patient_id:02d}')
+        axes[0, 1].set_xlabel('Fold')
+        axes[0, 1].set_ylabel('Sensitivity')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Specificity
+        axes[0, 2].bar(folds, specificities, alpha=0.7, color='teal')
+        axes[0, 2].axhline(y=avg_metrics['avg_specificity'], color='r', linestyle='--',
+                          label=f'Average: {avg_metrics["avg_specificity"]:.4f}')
+        axes[0, 2].set_title(f'Specificity (24 of 30) - Patient {patient_id:02d}')
+        axes[0, 2].set_xlabel('Fold')
+        axes[0, 2].set_ylabel('Specificity')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # FPR
+        axes[1, 0].bar(folds, fprs, alpha=0.7, color='orange')
+        axes[1, 0].axhline(y=avg_metrics['avg_fpr'], color='r', linestyle='--',
+                          label=f'Average: {avg_metrics["avg_fpr"]:.4f}')
+        axes[1, 0].set_title(f'FPR (24 of 30) - Patient {patient_id:02d}')
+        axes[1, 0].set_xlabel('Fold')
+        axes[1, 0].set_ylabel('FPR (alarms/hour)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # AUC
+        axes[1, 1].bar(folds, aucs, alpha=0.7, color='purple')
+        axes[1, 1].axhline(y=avg_metrics['avg_auc'], color='r', linestyle='--',
+                          label=f'Average: {avg_metrics["avg_auc"]:.4f}')
+        axes[1, 1].set_title(f'AUC - Patient {patient_id:02d}')
+        axes[1, 1].set_xlabel('Fold')
+        axes[1, 1].set_ylabel('AUC')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Hide the last subplot (2,2) as we only have 5 metrics
+        axes[1, 2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / f'patient_{patient_id:02d}_loocv_results_24of30.png', 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+def main():
+    """主函数"""
+    import argparse
+    
+    # 设置随机种子以确保可重复性
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+    
+    parser = argparse.ArgumentParser(description='EEG Conformer LOOCV Training - 24 of 30 Post-processing Version')
+    parser.add_argument('--patient', type=int, default=None, help='患者ID（不指定则训练所有患者）')
+    parser.add_argument('--root_path', type=str, 
+                       default='./conformer_processed_data',
+                       help='数据根目录')
+    parser.add_argument('--results_dir', type=str, 
+                       default='./results_loocv_24of30',
+                       help='结果保存目录')
+    parser.add_argument('--device', type=str, default=None,
+                       help='计算设备 (cuda/cpu)')
+    parser.add_argument('--use_multiscale', type=lambda x: x.lower() == 'true', default=True,
+                       help='使用多尺度卷积（kernel=13,25,51）。默认启用。用法: --use_multiscale True/False')
+    parser.add_argument('--use_tcn', type=lambda x: x.lower() == 'true', default=False,
+                       help='使用TCN+Transformer混合架构。默认禁用。用法: --use_tcn True/False')
+    parser.add_argument('--use_pos_encoding', type=lambda x: x.lower() == 'true', default=True,
+                       help='使用时间位置编码。默认启用。用法: --use_pos_encoding True/False')
+    parser.add_argument('--use_electrode_attention', type=lambda x: x.lower() == 'true', default=True,
+                       help='使用电极注意力机制（SE-Block）。默认启用。用法: --use_electrode_attention True/False')
+    
+    args = parser.parse_args()
+    
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"使用设备: {device}")
+    print(f"后处理策略: 24 of 30")
+    print(f"多尺度卷积: {'启用' if args.use_multiscale else '禁用（baseline）'}")
+    print(f"TCN混合: {'启用' if args.use_tcn else '禁用'}")
+    print(f"位置编码: {'启用' if args.use_pos_encoding else '禁用'}")
+    print(f"电极注意力: {'启用' if args.use_electrode_attention else '禁用'}")
+    
+    trainer = ConformerTrainerLOOCV(
+        data_dir=args.root_path,
+        results_dir=args.results_dir,
+        device=device,
+        use_multiscale=args.use_multiscale,
+        use_tcn=args.use_tcn,
+        use_pos_encoding=args.use_pos_encoding,
+        use_electrode_attention=args.use_electrode_attention
+    )
+    
+    if args.patient:
+        trainer.train_patient_loocv(args.patient)
+    else:
+        data_path = Path(args.root_path)
+        patient_dirs = sorted([d for d in data_path.iterdir() 
+                              if d.is_dir() and d.name.startswith('paz')])
+        
+        if not patient_dirs:
+            print("错误: 未找到患者数据")
+            return
+        
+        available_patients = [int(d.name[3:]) for d in patient_dirs]
+        
+        print("="*80)
+        print("EEG Conformer 留一交叉验证训练 - 24 of 30后处理版本")
+        print("="*80)
+        print(f"可用患者: {available_patients}")
+        print(f"开始训练 {len(available_patients)} 名患者")
+        print("="*80)
+        
+        for patient_id in available_patients:
+            trainer.train_patient_loocv(patient_id)
+
+
+if __name__ == '__main__':
+    main()
